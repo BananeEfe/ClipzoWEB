@@ -1,0 +1,306 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+
+import type { Project } from "../../../services/projects.service";
+import type { WordCue } from "../lib/media/transcription-export.util";
+import {
+  initClipperProjectSync,
+  loadClipperSourceMediaFile,
+} from "../persistence/bootstrap.util";
+import { getClipperMetadataFromProject } from "../persistence/metadata-autosave.util";
+import type { ClipperProjectMetadata } from "../persistence/project-metadata.util";
+import { canRestoreTranscriptionFromMetadata } from "../persistence/project-metadata.util";
+import {
+  fetchClipperProjectSettings,
+  fetchRenderQueueFormats,
+} from "../persistence/clipper-db-api.util";
+import { fetchClipperRangeWords } from "../persistence/clipper-range-words-api.util";
+import { sanitizeRenderQueueSelections } from "../shared/render-queue-utils.util";
+import type { ClipperSettings } from "../settings/settings.util";
+import { clipperError, clipperLog } from "../shared/logger.util";
+import {
+  CLIPPER_SESSION_BOOT_STEPS,
+  isRestoreBootFlow,
+  markStepsThroughDone,
+  markStepActive,
+  simpleLoadingStatus,
+  type ClipperLoadingStatus,
+} from "../shared/loading-status.util";
+import { yieldToMain } from "../shared/yield-to-main.util";
+import {
+  clipperPipelineService,
+  computeResumePlan,
+  resolvePersistedClipRange,
+  type ClipperFaceAnalysisRecord,
+  type ClipperPipelineStepRecord,
+  type ClipperResumePlan,
+} from "../persistence/pipeline-api.util";
+import { AUTOFLIP_ANALYZER_VERSION } from "../engine/autoflip/config/config.constants";
+
+export type ClipperLoaderPhase = "loading" | "ready" | "error";
+
+export interface ClipperLoadedProject {
+  metadata: ClipperProjectMetadata;
+  settings: ClipperSettings;
+  renderQueueFormats: Record<number, string[]>;
+  sourceFile: File | null;
+  sourceUrl: string | null;
+  sourceDuration: number | null;
+  sourceFileName: string | null;
+  mediaFileId: string | null;
+  words: WordCue[];
+  steps: ClipperPipelineStepRecord[];
+  resumePlan: ClipperResumePlan;
+  faceAnalysis: ClipperFaceAnalysisRecord | null;
+}
+
+const INITIAL_LOADING_STATUS = simpleLoadingStatus("Opening clip project…");
+
+export function useClipperProjectLoader(project: Project, token: string | null) {
+  const [phase, setPhase] = useState<ClipperLoaderPhase>("loading");
+  const [error, setError] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState<ClipperLoadedProject | null>(null);
+  const [reloadToken, setReloadToken] = useState(0);
+  const [loadingStatus, setLoadingStatus] = useState<ClipperLoadingStatus>(INITIAL_LOADING_STATUS);
+  const loadGenerationRef = useRef(0);
+
+  const reload = useCallback(() => {
+    setReloadToken((value) => value + 1);
+  }, []);
+
+  useEffect(() => {
+    if (project.projectType !== "clipper") {
+      setPhase("error");
+      setError("This project is not a Clipper session.");
+      return;
+    }
+
+    let cancelled = false;
+    const generation = ++loadGenerationRef.current;
+
+    const isStale = () => cancelled || generation !== loadGenerationRef.current;
+
+    const load = async () => {
+      setPhase("loading");
+      setError(null);
+      setLoadingStatus(INITIAL_LOADING_STATUS);
+
+      let isRestoreFlow = false;
+
+      const applyLoading = async (status: ClipperLoadingStatus): Promise<void> => {
+        if (isStale()) return;
+        setLoadingStatus(status);
+        await yieldToMain();
+      };
+
+      const report = async (
+        stepId: string,
+        message: string,
+        detail?: string,
+      ): Promise<void> => {
+        if (!isRestoreFlow) {
+          await applyLoading(simpleLoadingStatus(message));
+          return;
+        }
+        await applyLoading({
+          message,
+          detail,
+          steps: markStepActive(CLIPPER_SESSION_BOOT_STEPS, stepId),
+          phaseStartedAt: Date.now(),
+        });
+      };
+
+      try {
+        await applyLoading(simpleLoadingStatus("Reading project metadata"));
+        let metadata = getClipperMetadataFromProject(project.metadata);
+        isRestoreFlow = isRestoreBootFlow(null, metadata.stage);
+
+        await report(
+          "metadata",
+          "Reading project metadata",
+          "Parsing clipper settings and saved stage from the project record",
+        );
+
+        await report(
+          "sync",
+          "Initializing local project sync",
+          "Resetting asset registry and connecting to the project synchronizer",
+        );
+        await initClipperProjectSync(project, token ?? "");
+
+        await report(
+          "pipeline",
+          "Loading pipeline state",
+          "Fetching completed steps and resume plan from the server",
+        );
+        const pipelineState = await clipperPipelineService.getPipeline(project.id);
+        const { steps, faceAnalysis } = pipelineState;
+        // Single normalization point: from here on `metadata` carries the confirmed range,
+        // so downstream `resolvePersistedClipRange` calls only re-run the step fallback for
+        // callers that never went through this loader.
+        const range = resolvePersistedClipRange(metadata, steps);
+        if (range.clipEnd != null) {
+          metadata = { ...metadata, clipStart: range.clipStart, clipEnd: range.clipEnd };
+        }
+        const resumePlan = computeResumePlan(steps, {
+          requiredAnalyzerVersion: AUTOFLIP_ANALYZER_VERSION,
+          hasClipRange: range.clipEnd != null,
+        });
+        isRestoreFlow = isRestoreBootFlow(resumePlan, metadata.stage);
+
+        await report(
+          "settings",
+          "Loading clipper settings",
+          "Fetching project settings and render queue from the server",
+        );
+        const [settings, renderQueueFormats] = await Promise.all([
+          fetchClipperProjectSettings(project.id),
+          fetchRenderQueueFormats(project.id),
+        ]);
+        const sanitizedRenderQueue = sanitizeRenderQueueSelections(renderQueueFormats);
+
+        await report(
+          "source",
+          "Locating source video",
+          "Loading project sync state from server",
+        );
+        const source = await loadClipperSourceMediaFile(
+          project,
+          token ?? "",
+          metadata.sourceMediaFileId,
+          {
+            onPhase: async (message, detail) => {
+              if (isStale()) return;
+              if (!isRestoreFlow) {
+                await applyLoading(simpleLoadingStatus(message));
+                return;
+              }
+              setLoadingStatus({
+                message,
+                detail,
+                steps: markStepActive(CLIPPER_SESSION_BOOT_STEPS, "source"),
+                phaseStartedAt: Date.now(),
+              });
+              await yieldToMain();
+            },
+          },
+        );
+
+        if (!source) {
+          if (!isStale()) {
+            setLoadingStatus(
+              isRestoreFlow
+                ? {
+                    message: "Project ready",
+                    detail: metadata.sourceMediaFileId
+                      ? "Source video file could not be located on this device"
+                      : "No source video attached yet",
+                    steps: markStepsThroughDone(CLIPPER_SESSION_BOOT_STEPS, "finalize"),
+                  }
+                : simpleLoadingStatus("Project ready"),
+            );
+            setLoaded({
+              metadata: metadata.sourceMediaFileId
+                ? { ...metadata, sourceMediaFileId: null, stage: "idle" }
+                : metadata,
+              settings,
+              renderQueueFormats: sanitizedRenderQueue,
+              sourceFile: null,
+              sourceUrl: null,
+              sourceDuration: null,
+              sourceFileName: null,
+              mediaFileId: null,
+              words: [],
+              steps,
+              resumePlan,
+              faceAnalysis,
+            });
+            setPhase("ready");
+          }
+          return;
+        }
+
+        if (!metadata.sourceMediaFileId) {
+          metadata = { ...metadata, sourceMediaFileId: source.mediaFile.id };
+        }
+
+        let words: WordCue[] = [];
+        const clipDuration =
+          metadata.clipEnd != null ? metadata.clipEnd - metadata.clipStart : null;
+
+        const shouldLoadWords =
+          resumePlan.skipTranscribe ||
+          (metadata.sourceMediaFileId &&
+            clipDuration != null &&
+            clipDuration > 0 &&
+            canRestoreTranscriptionFromMetadata(metadata));
+
+        if (shouldLoadWords && metadata.sourceMediaFileId && clipDuration != null && clipDuration > 0) {
+          await report(
+            "transcription",
+            "Restoring transcription",
+            "Loading saved word-level transcript for this project",
+          );
+          words = await fetchClipperRangeWords(project.id);
+          await yieldToMain();
+          clipperLog("loader: restored transcription", {
+            wordCount: words.length,
+            stage: metadata.stage,
+            skipTranscribe: resumePlan.skipTranscribe,
+          });
+        } else {
+          await report(
+            "transcription",
+            "Skipping transcription restore",
+            "Transcript not needed for the current project stage",
+          );
+        }
+
+        await report(
+          "finalize",
+          "Preparing workspace",
+          resumePlan.target === "restoring"
+            ? "Handing off to session restore pipeline"
+            : "Almost ready",
+        );
+
+        if (!isStale()) {
+          setLoaded({
+            metadata,
+            settings,
+            renderQueueFormats: sanitizedRenderQueue,
+            sourceFile: source.file,
+            sourceUrl: source.sourceUrl,
+            sourceDuration: source.mediaFile.duration ?? null,
+            sourceFileName: source.mediaFile.name,
+            mediaFileId: source.mediaFile.id,
+            words,
+            steps,
+            resumePlan,
+            faceAnalysis,
+          });
+          setPhase("ready");
+        }
+      } catch (err) {
+        clipperError("loader: failed", err);
+        if (!isStale()) {
+          setPhase("error");
+          setError(err instanceof Error ? err.message : "Failed to load Clipper project.");
+        }
+      }
+    };
+
+    void load();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [project, reloadToken, token]);
+
+  return {
+    phase,
+    error,
+    loaded,
+    reload,
+    loadingStatus,
+  };
+}

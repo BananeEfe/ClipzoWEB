@@ -1,0 +1,417 @@
+use crate::clipper::data::{
+    clipper_export_file_path, clipper_project_data_dir, clipper_project_exports_dir,
+    clipper_project_root, clipper_projects_root, extract_segment_to_project_data,
+    extract_studio_clip_for_project, extract_studio_thumbnails_for_project,
+    validate_export_file_name, write_export_file_bytes_at,
+    write_project_data_file_bytes_at,
+};
+use crate::video::ffmpeg::studio_clip::ExtractClipperStudioClipResult;
+use crate::video::ffmpeg::studio_thumbnails::ExtractClipperStudioThumbnailsResult;
+use serde::Serialize;
+use std::fs;
+use tauri::ipc::{InvokeBody, Request, Response};
+use tauri::AppHandle;
+use tauri::Manager;
+use tauri_plugin_opener::OpenerExt;
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StageClipperStudioImportResult {
+    pub project_data_dir: String,
+    pub manifest_absolute_path: String,
+    pub video_absolute_path: String,
+}
+
+#[tauri::command]
+pub fn open_clipper_projects_dir(app: AppHandle) -> Result<String, String> {
+    let path = clipper_projects_root(&app)?;
+    fs::create_dir_all(&path).map_err(|e| e.to_string())?;
+    app.opener()
+        .open_path(path.to_string_lossy().to_string(), None::<&str>)
+        .map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub fn ensure_clipper_project_data_dir(
+    app: AppHandle,
+    project_id: String,
+) -> Result<String, String> {
+    let path = clipper_project_data_dir(&app, &project_id)?;
+    fs::create_dir_all(&path).map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub fn commit_clipper_prepared_range(
+    app: AppHandle,
+    project_id: String,
+    prepared_file_name: String,
+    source_revision: String,
+) -> Result<String, String> {
+    #[cfg(windows)]
+    {
+        let directory = clipper_project_data_dir(&app, &project_id)?;
+        crate::video::ffmpeg::compatible_media::commit_prepared_range(
+            &directory, &prepared_file_name, &source_revision,
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (app, project_id, prepared_file_name, source_revision);
+        Err("Media recovery requires Windows.".into())
+    }
+}
+
+#[tauri::command]
+pub fn finalize_clipper_project_data_file(app: AppHandle, project_id: String, temporary_name: String, file_name: String) -> Result<String, String> {
+    validate_export_file_name(&temporary_name)?;
+    validate_export_file_name(&file_name)?;
+    if !temporary_name.contains(".part.") { return Err("Expected a temporary project data file".into()); }
+    let directory = clipper_project_data_dir(&app, &project_id)?;
+    let destination = directory.join(file_name);
+    if destination.exists() { return Err("Project data destination already exists".into()); }
+    fs::rename(directory.join(temporary_name), &destination).map_err(|e| e.to_string())?;
+    Ok(destination.to_string_lossy().into())
+}
+
+#[tauri::command]
+pub fn remove_clipper_project_data_partial(app: AppHandle, project_id: String, file_name: String) -> Result<(), String> {
+    validate_export_file_name(&file_name)?;
+    if !file_name.contains(".part.") { return Err("Only temporary project data files can be discarded".into()); }
+    match fs::remove_file(clipper_project_data_dir(&app, &project_id)?.join(file_name)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[tauri::command]
+pub async fn remove_clipper_project_data_dir(
+    app: AppHandle,
+    db: tauri::State<'_, crate::storage::database::LocalDb>,
+    project_id: String,
+) -> Result<(), String> {
+    crate::storage::export_cleanup::delete_project_exports(&db.database, &project_id)
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let path = clipper_project_root(&app, &project_id)?;
+    if path.exists() {
+        fs::remove_dir_all(&path).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn read_clipper_project_data_file(
+    app: AppHandle,
+    project_id: String,
+    file_name: String,
+) -> Result<String, String> {
+    let path = clipper_project_data_dir(&app, &project_id)?.join(file_name);
+    tokio::task::spawn_blocking(move || fs::read_to_string(&path).map_err(|e| e.to_string()))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub fn write_clipper_project_data_file(
+    app: AppHandle,
+    project_id: String,
+    file_name: String,
+    contents: String,
+) -> Result<(), String> {
+    let path = clipper_project_data_dir(&app, &project_id)?.join(&file_name);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    fs::write(path, contents).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn write_clipper_project_data_bytes(
+    app: AppHandle,
+    project_id: String,
+    file_name: String,
+    contents: Vec<u8>,
+) -> Result<(), String> {
+    let dir = clipper_project_data_dir(&app, &project_id)?;
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    fs::write(dir.join(file_name), contents).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn write_clipper_project_data_bytes_at(
+    app: AppHandle,
+    request: Request<'_>,
+) -> Result<(), String> {
+    let (project_id, file_name, position, contents) = raw_positional_write(&request)?;
+    write_project_data_file_bytes_at(&app, &project_id, &file_name, position, contents)
+}
+
+#[tauri::command]
+pub fn get_clipper_project_data_file_path(
+    app: AppHandle,
+    project_id: String,
+    file_name: String,
+) -> Result<String, String> {
+    let path = clipper_project_data_dir(&app, &project_id)?.join(&file_name);
+    if !path.exists() {
+        return Err(format!("File not found: {file_name}"));
+    }
+    Ok(path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub async fn open_clipper_project_data_dir(
+    app: AppHandle,
+    project_id: String,
+) -> Result<(), String> {
+    let path = ensure_clipper_project_data_dir(app.clone(), project_id)?;
+    app.opener()
+        .open_path(path, None::<&str>)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn stage_clipper_studio_import(
+    app: AppHandle,
+    project_id: String,
+    manifest_file_name: String,
+    video_file_name: String,
+    manifest_contents: String,
+) -> Result<StageClipperStudioImportResult, String> {
+    validate_export_file_name(&manifest_file_name)?;
+    validate_export_file_name(&video_file_name)?;
+
+    let project_data = clipper_project_data_dir(&app, &project_id)?;
+    fs::create_dir_all(&project_data).map_err(|error| error.to_string())?;
+
+    let video_src = project_data.join(&video_file_name);
+    if !video_src.is_file() {
+        return Err(format!(
+            "Missing {video_file_name} in project data. Finish clip processing first."
+        ));
+    }
+
+    let manifest_dst = project_data.join(&manifest_file_name);
+    let project_data_dir = project_data.to_string_lossy().to_string();
+    let manifest_absolute_path = manifest_dst.to_string_lossy().to_string();
+    let video_absolute_path = video_src.to_string_lossy().to_string();
+
+    let mut value: serde_json::Value = serde_json::from_str(&manifest_contents)
+        .map_err(|error| format!("Invalid studio import JSON: {error}"))?;
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "projectDataDir".to_string(),
+            serde_json::Value::String(project_data_dir.clone()),
+        );
+        obj.insert(
+            "manifestAbsolutePath".to_string(),
+            serde_json::Value::String(manifest_absolute_path.clone()),
+        );
+        obj.insert(
+            "videoAbsolutePath".to_string(),
+            serde_json::Value::String(video_absolute_path.clone()),
+        );
+    }
+    let enriched = serde_json::to_string_pretty(&value)
+        .map_err(|error| format!("Failed to serialize staged manifest: {error}"))?;
+    fs::write(&manifest_dst, enriched).map_err(|error| error.to_string())?;
+
+    if let Ok(documents) = app.path().document_dir() {
+        let obsolete = documents.join("OpenClipper").join("studio-import");
+        if obsolete.is_dir() {
+            let _ = fs::remove_dir_all(&obsolete);
+        }
+    }
+
+    Ok(StageClipperStudioImportResult {
+        project_data_dir,
+        manifest_absolute_path,
+        video_absolute_path,
+    })
+}
+
+#[tauri::command]
+pub async fn extract_clipper_segment_to_project_data(
+    app: AppHandle,
+    project_id: String,
+    file_path: String,
+    start_time: f64,
+    end_time: f64,
+) -> Result<String, String> {
+    extract_segment_to_project_data(&app, &project_id, file_path, start_time, end_time).await
+}
+
+#[tauri::command]
+pub async fn extract_clipper_studio_clip(
+    app: AppHandle,
+    project_id: String,
+    start_sec: f64,
+    end_sec: f64,
+) -> Result<ExtractClipperStudioClipResult, String> {
+    extract_studio_clip_for_project(&app, &project_id, start_sec, end_sec).await
+}
+
+#[tauri::command]
+pub async fn extract_clipper_studio_thumbnails(
+    app: AppHandle,
+    project_id: String,
+    video_file_name: String,
+    force: Option<bool>,
+) -> Result<ExtractClipperStudioThumbnailsResult, String> {
+    extract_studio_thumbnails_for_project(
+        &app,
+        &project_id,
+        video_file_name,
+        force.unwrap_or(false),
+    )
+    .await
+}
+
+#[tauri::command]
+pub fn ensure_clipper_project_exports_dir(
+    app: AppHandle,
+    project_id: String,
+) -> Result<String, String> {
+    let path = clipper_project_exports_dir(&app, &project_id)?;
+    fs::create_dir_all(&path).map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+fn raw_write_header(request: &Request<'_>, name: &str) -> Result<String, String> {
+    let value = request
+        .headers()
+        .get(name)
+        .ok_or_else(|| format!("Missing {name} header."))?
+        .to_str()
+        .map_err(|error| format!("Invalid {name} header: {error}"))?;
+    percent_encoding::percent_decode_str(value)
+        .decode_utf8()
+        .map(|decoded| decoded.into_owned())
+        .map_err(|error| format!("Invalid {name} header: {error}"))
+}
+
+fn raw_positional_write<'a>(
+    request: &'a Request<'_>,
+) -> Result<(String, String, u64, &'a [u8]), String> {
+    let project_id = raw_write_header(request, "x-clipper-project-id")?;
+    let file_name = raw_write_header(request, "x-clipper-file-name")?;
+    let position = raw_write_header(request, "x-clipper-position")?
+        .parse::<u64>()
+        .map_err(|error| format!("Invalid x-clipper-position header: {error}"))?;
+    let InvokeBody::Raw(contents) = request.body() else {
+        return Err("Expected a raw binary request body.".to_string());
+    };
+    Ok((project_id, file_name, position, contents))
+}
+
+#[tauri::command]
+pub async fn write_clipper_export_file_bytes_at(
+    app: AppHandle,
+    request: Request<'_>,
+) -> Result<(), String> {
+    let (project_id, file_name, position, contents) = raw_positional_write(&request)?;
+    write_export_file_bytes_at(&app, &project_id, &file_name, position, contents)
+}
+
+#[tauri::command]
+pub fn remove_clipper_export_file(
+    app: AppHandle,
+    project_id: String,
+    file_name: String,
+) -> Result<(), String> {
+    let path = clipper_export_file_path(&app, &project_id, &file_name)?;
+    if path.exists() {
+        fs::remove_file(&path).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_clipper_export_file_path(
+    app: AppHandle,
+    project_id: String,
+    file_name: String,
+) -> Result<String, String> {
+    let path = clipper_export_file_path(&app, &project_id, &file_name)?;
+    if !path.exists() {
+        return Err(format!("Export file not found: {file_name}"));
+    }
+    Ok(path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub async fn read_clipper_export_file_bytes(
+    app: AppHandle,
+    project_id: String,
+    file_name: String,
+) -> Result<Response, String> {
+    let path = clipper_export_file_path(&app, &project_id, &file_name)?;
+    if !path.exists() {
+        return Err(format!("Export file not found: {file_name}"));
+    }
+    let bytes = tokio::task::spawn_blocking(move || fs::read(&path).map_err(|e| e.to_string()))
+        .await
+        .map_err(|e| e.to_string())??;
+    Ok(Response::new(bytes))
+}
+
+#[tauri::command]
+pub fn stat_clipper_export_file(
+    app: AppHandle,
+    project_id: String,
+    file_name: String,
+) -> Result<u64, String> {
+    let path = clipper_export_file_path(&app, &project_id, &file_name)?;
+    let metadata = fs::metadata(&path).map_err(|e| e.to_string())?;
+    Ok(metadata.len())
+}
+
+#[tauri::command]
+pub fn copy_clipper_export_file(
+    app: AppHandle,
+    project_id: String,
+    file_name: String,
+    destination_path: String,
+) -> Result<(), String> {
+    let source = clipper_export_file_path(&app, &project_id, &file_name)?;
+    if !source.exists() {
+        return Err(format!("Export file not found: {file_name}"));
+    }
+    fs::copy(&source, &destination_path)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn open_clipper_project_exports_dir(
+    app: AppHandle,
+    project_id: String,
+) -> Result<String, String> {
+    let path = clipper_project_exports_dir(&app, &project_id)?;
+    fs::create_dir_all(&path).map_err(|e| e.to_string())?;
+    app.opener()
+        .open_path(path.to_string_lossy().to_string(), None::<&str>)
+        .map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub fn reveal_clipper_export_in_folder(
+    app: AppHandle,
+    project_id: String,
+    file_name: String,
+) -> Result<String, String> {
+    let path = clipper_export_file_path(&app, &project_id, &file_name)?;
+    if !path.exists() {
+        return Err(format!("Export file not found: {file_name}"));
+    }
+
+    app.opener()
+        .reveal_item_in_dir(&path)
+        .map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().to_string())
+}

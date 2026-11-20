@@ -1,0 +1,355 @@
+import { stageManifestForStudioImport } from "./stage-studio-import.util";
+import { invoke } from "@tauri-apps/api/core";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import type { ClipperGeneratedClip } from "../../engine/segmentation";
+import type { ClipperFrameContext } from "../../engine/types/render.types";
+import { resolveCaptionPreset } from "../captions/caption-presets.util";
+import {
+  resolveNonOverlappingCaptionGroups,
+  wordCuesToCaptionGroups,
+} from "../media/transcription-export.util";
+import {
+  canonicalFormatDims,
+  getClipperFormatDef,
+  type ClipperFormatDef,
+} from "../../shared/formats.util";
+import type { FrameEffectSize } from "../media/video-frame-effect.util";
+import type { ClipperSettings } from "../../settings/settings.util";
+import { isTauri } from "../../../../shared/utils/platform.util";
+import { appToast } from "../../../../shared/utils/toast.service";
+import { openExternalAuthUrl } from "../../../../shared/utils/desktop-auth.util";
+import {
+  CLIPPER_STUDIO_IMPORT_MANIFEST_FILE,
+} from "../../platform/native-source.util";
+import {
+  extractClipperStudioClip,
+  extractClipperStudioThumbnails,
+  type ClipperStudioClipCut,
+  type ClipperStudioClipRange,
+} from "../../persistence/project-data-files.util";
+import { clipperWarn } from "../../shared/logger.util";
+import {
+  CLIPPER_STUDIO_IMPORT_VERSION,
+  type ClipperStudioImport,
+} from "./clipper-studio-import.types";
+import { sampleStudioFrameTrack } from "./sample-studio-frame-track.util";
+
+export const DEFAULT_STUDIO_IMPORT_MANIFEST_NAME = CLIPPER_STUDIO_IMPORT_MANIFEST_FILE;
+
+function resolvePrimaryFormat(
+  settings: ClipperSettings,
+  preferredFormatId?: string,
+): ClipperFormatDef {
+  if (preferredFormatId) {
+    const preferred = getClipperFormatDef(preferredFormatId);
+    if (preferred) return preferred;
+  }
+  const enabled = settings.formats.enabledFormatIds
+    .map((id) => getClipperFormatDef(id))
+    .filter((f): f is ClipperFormatDef => Boolean(f));
+  const vertical = enabled.find((f) => f.aspectId === "9-16");
+  return vertical ?? enabled[0] ?? getClipperFormatDef("tiktok")!;
+}
+
+export interface BuildClipperStudioImportInput {
+  clip: ClipperGeneratedClip;
+  settings: ClipperSettings;
+  frameContext: ClipperFrameContext | null;
+  sourceVideoFileName: string;
+  /** Pixel size of the video the preview draws from (`videoWidth` / `videoHeight`). */
+  sourceSize: FrameEffectSize;
+  preferredFormatId?: string;
+  manifestFileName?: string;
+}
+
+export function buildClipperStudioImport(
+  input: BuildClipperStudioImportInput,
+): ClipperStudioImport {
+  const format = resolvePrimaryFormat(input.settings, input.preferredFormatId);
+  const dims = canonicalFormatDims(format);
+  const preset = resolveCaptionPreset(input.settings.captions.presetId);
+  const segments = input.clip.segments?.length
+    ? input.clip.segments
+    : [{ startSec: input.clip.startSec, endSec: input.clip.endSec }];
+  const frameTrack = sampleStudioFrameTrack({
+    formatDef: format,
+    source: input.sourceSize,
+    output: dims,
+    analysis: input.frameContext?.smartCropAnalysis ?? null,
+    disabledCollageRegionIds: input.frameContext?.disabledCollageRegionIds ?? [],
+    segments,
+  });
+  const clipWords = input.clip.words ?? [];
+  const words = clipWords.filter((w) => !w.deleted);
+  const wordsPerGroup =
+    input.settings.captions.wordsPerGroup || preset.wordsPerGroup;
+  const rawCaptionGroups =
+    input.clip.captionGroups?.length > 0
+      ? input.clip.captionGroups
+      : (input.frameContext?.captionGroups ?? []);
+  // All words deleted by the user means no captions, not a fallback to the ASR groups.
+  const captionGroups =
+    clipWords.length > 0
+      ? wordCuesToCaptionGroups(words, wordsPerGroup)
+      : resolveNonOverlappingCaptionGroups(rawCaptionGroups);
+
+  return {
+    version: CLIPPER_STUDIO_IMPORT_VERSION,
+    createdAt: new Date().toISOString(),
+    formatId: format.id,
+    aspectId: format.aspectId,
+    width: dims.width,
+    height: dims.height,
+    aspectRatio: dims.width / dims.height,
+    sourceVideoFileName: input.sourceVideoFileName,
+    manifestFileName: input.manifestFileName ?? DEFAULT_STUDIO_IMPORT_MANIFEST_NAME,
+    totalDurationSec: input.clip.durationSec,
+    segments: segments.map((s) => ({
+      startSec: s.startSec,
+      endSec: s.endSec,
+    })),
+    words: words.map((w) => ({
+      text: w.text,
+      start: w.start,
+      end: w.end,
+    })),
+    captionGroups: captionGroups.map((g) => ({
+      start: g.start,
+      end: g.end,
+      words: (g.words ?? []).map((w) => ({
+        text: w.text,
+        start: w.start,
+        end: w.end,
+      })),
+    })),
+    caption: {
+      enabled: input.settings.captions.enabled,
+      presetId: preset.id,
+      wordsPerGroup: wordsPerGroup,
+      position: input.settings.captions.position,
+      size: input.settings.captions.size,
+    },
+    frameTrack,
+  };
+}
+
+export function downloadClipperStudioImportJson(
+  manifest: ClipperStudioImport,
+  fileName = DEFAULT_STUDIO_IMPORT_MANIFEST_NAME,
+): void {
+  const blob = new Blob([JSON.stringify(manifest, null, 2)], {
+    type: "application/json",
+  });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = fileName;
+  a.rel = "noopener";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 2_000);
+}
+
+export function getStudioBaseUrl(): string {
+  const fromEnv = (import.meta as ImportMeta & { env?: Record<string, string> })
+    .env?.VITE_STUDIO_URL;
+  return (fromEnv && fromEnv.trim()) || "https://localhost:5173";
+}
+
+const DEFAULT_CLIPPER_LOCAL_HTTP_PORT = 12742;
+
+async function resolveClipperLocalHttpPort(): Promise<number> {
+  if (!isTauri()) return DEFAULT_CLIPPER_LOCAL_HTTP_PORT;
+  const port = await invoke<number>("get_open_clipper_local_http_port");
+  if (!Number.isFinite(port) || port <= 0) throw new Error("Local HTTP server returned an invalid port.");
+  return port;
+}
+
+export function buildStudioImportUrl(
+  manifest: ClipperStudioImport,
+  options?: { projectId?: string; clipperPort?: number },
+): string {
+  const base = getStudioBaseUrl().replace(/\/+$/, "");
+  const params = new URLSearchParams({
+    clipperImport: "1",
+    manifest: manifest.manifestFileName,
+    videoHint: manifest.sourceVideoFileName,
+    formatId: manifest.formatId,
+    aspect: `${manifest.width}x${manifest.height}`,
+  });
+  const id = options?.projectId?.trim();
+  if (id) {
+    params.set("projectId", id);
+  }
+  const port = options?.clipperPort ?? DEFAULT_CLIPPER_LOCAL_HTTP_PORT;
+  params.set("clipperPort", String(port));
+  return `${base}/from-clipper?${params.toString()}`;
+}
+
+async function openStudioUrl(url: string): Promise<void> {
+  if (isTauri()) {
+    try {
+      await openUrl(url);
+      return;
+    } catch {
+      await openExternalAuthUrl(url);
+      return;
+    }
+  }
+
+  const opened = window.open(url, "_blank", "noopener,noreferrer");
+  if (!opened) {
+    throw new Error(
+      "Browser blocked the Studio popup. Allow popups for this site, or open Studio manually at " +
+        url,
+    );
+  }
+}
+
+export type OpenInStudioPhase =
+  | "preparing"
+  | "thumbnails"
+  | "staging"
+  | "opening";
+
+export interface OpenInStudioProgress {
+  phase: OpenInStudioPhase;
+  ratio: number;
+}
+
+function clipRangeForManifest(manifest: ClipperStudioImport): ClipperStudioClipRange {
+  const segments = manifest.segments ?? [];
+  if (segments.length === 0) {
+    return { startSec: 0, endSec: Math.max(0.1, manifest.totalDurationSec) };
+  }
+  return {
+    startSec: Math.min(...segments.map((segment) => segment.startSec)),
+    endSec: Math.max(...segments.map((segment) => segment.endSec)),
+  };
+}
+
+/**
+ * Points the manifest at the per-clip cut. Segments and frame samples live on the
+ * source-file timeline, so they shift by the cut offset; words and caption
+ * groups are already clip-relative and stay as they are.
+ */
+export function rebaseManifestForStudioClip(
+  manifest: ClipperStudioImport,
+  cut: Pick<ClipperStudioClipCut, "fileName" | "offsetSec" | "durationSec">,
+): ClipperStudioImport {
+  const shift = (t: number) => Math.max(0, t - cut.offsetSec);
+  return {
+    ...manifest,
+    sourceVideoFileName: cut.fileName,
+    segments: manifest.segments.map((segment) => ({
+      startSec: shift(segment.startSec),
+      endSec: Math.min(cut.durationSec, shift(segment.endSec)),
+    })),
+    frameTrack: manifest.frameTrack
+      .filter((sample) => {
+        const t = sample.t - cut.offsetSec;
+        return t >= 0 && t <= cut.durationSec;
+      })
+      .map((sample) => ({ ...sample, t: sample.t - cut.offsetSec })),
+  };
+}
+
+export interface OpenClipInStudioOptions {
+  projectId?: string;
+  onProgress?: (progress: OpenInStudioProgress) => void;
+}
+
+const PHASE_RANGES: Record<OpenInStudioPhase, { start: number; end: number }> = {
+  preparing: { start: 0, end: 0.15 },
+  thumbnails: { start: 0.15, end: 0.85 },
+  staging: { start: 0.85, end: 0.95 },
+  opening: { start: 0.95, end: 1 },
+};
+
+function mapPhaseProgress(
+  phase: OpenInStudioPhase,
+  localRatio: number,
+): OpenInStudioProgress {
+  const range = PHASE_RANGES[phase];
+  const t = Math.max(0, Math.min(1, localRatio));
+  return {
+    phase,
+    ratio: range.start + (range.end - range.start) * t,
+  };
+}
+
+export async function openClipInStudio(
+  manifest: ClipperStudioImport,
+  options?: OpenClipInStudioOptions,
+): Promise<void> {
+  const fileName = manifest.manifestFileName || DEFAULT_STUDIO_IMPORT_MANIFEST_NAME;
+  let resolved = manifest;
+  const projectId = options?.projectId?.trim();
+  const report = (phase: OpenInStudioPhase, localRatio: number) => {
+    options?.onProgress?.(mapPhaseProgress(phase, localRatio));
+  };
+
+  try {
+    report("preparing", 0);
+
+    if (isTauri() && projectId) {
+      let clipManifest = manifest;
+      try {
+        const cut = await extractClipperStudioClip(projectId, clipRangeForManifest(manifest));
+        clipManifest = rebaseManifestForStudioClip(manifest, cut);
+      } catch (error) {
+        clipperWarn("studio: clip cut failed, sending full range", { error: String(error) });
+      }
+      report("preparing", 1);
+
+      let withThumbs = clipManifest;
+      try {
+        report("thumbnails", 0);
+        const thumbs = await extractClipperStudioThumbnails(
+          projectId,
+          clipManifest.sourceVideoFileName,
+          false,
+          (thumbRatio) => report("thumbnails", thumbRatio),
+        );
+        report("thumbnails", 1);
+        if (thumbs && thumbs.count > 0) {
+          withThumbs = {
+            ...clipManifest,
+            thumbnails: {
+              indexFileName: thumbs.indexFileName,
+              packFileName: thumbs.packFileName,
+              intervalSec: thumbs.intervalSec,
+              height: thumbs.height,
+              count: thumbs.count,
+            },
+          };
+        }
+      } catch {
+        report("thumbnails", 1);
+      }
+      report("staging", 0);
+      resolved = await stageManifestForStudioImport(projectId, withThumbs);
+      report("staging", 1);
+    } else {
+      report("preparing", 1);
+      downloadClipperStudioImportJson(resolved, fileName);
+      report("staging", 1);
+    }
+
+    report("opening", 0);
+    const clipperPort = await resolveClipperLocalHttpPort();
+    const url = buildStudioImportUrl(resolved, { projectId, clipperPort });
+    await openStudioUrl(url);
+    report("opening", 1);
+
+    appToast.success(
+      "Opening Studio",
+      "Import starts automatically while Open Clipper is running.",
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    appToast.error("Could not open Studio", message);
+    throw error;
+  }
+}

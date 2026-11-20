@@ -1,0 +1,104 @@
+[package]
+name = "open-clipper"
+version = "26.11.2"
+description = "Open Clipper desktop app"
+authors = ["GrepCut"]
+license = "MIT"
+edition = "2021"
+rust-version = "1.91"
+default-run = "open-clipper"
+
+[lib]
+name = "tauri_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "open-clipper-mcp"
+path = "src/bin/open-clipper-mcp.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+vcpkg = "0.2"
+serde_json = "1.0"
+sha2 = "0.10"
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+log = "0.4"
+sea-orm = { version = "=2.0.0-rc.42", default-features = false, features = ["sqlx-sqlite", "runtime-tokio", "macros", "schema-sync", "with-chrono", "with-json"] }
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2"
+serialize-to-javascript = "0.1.2"
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-log = "2"
+dirs = "6"
+ffmpeg-next = { git = "https://github.com/zmwangx/rust-ffmpeg.git", version = "8.1.0" }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-updater = "2"
+image = "0.25.6"
+base64 = "0.22.1"
+fast_image_resize = "4.2.3"
+lapjv = "0.3.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio-util = { version = "0.7", features = ["rt", "io"] }
+url = "2"
+percent-encoding = "2"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "http2", "json"] }
+sha2 = "0.10"
+sherpa-onnx = { path = "vendor/sherpa-onnx", default-features = false, features = ["shared"] }
+crossbeam-channel = "0.5"
+tar = "0.4"
+bzip2 = "0.5"
+uuid = { version = "1", features = ["v4", "v5"] }
+http-range-header = "0.4"
+hound = "3.5"
+ort = { version = "2.0.0-rc.10", default-features = false, features = ["std", "ndarray", "load-dynamic", "directml"] }
+ndarray = "0.16"
+realfft = "3.4"
+rmcp = { version = "3.0.1", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
+anyhow = "1.0.104"
+schemars = "1.2.2"
+axum = "0.8"
+
+[profile.release]
+codegen-units = 1
+opt-level = 3
+lto = "thin"
+strip = "symbols"
+
+[[example]]
+name = "parakeet_smoke"
+path = "examples/parakeet_smoke.rs"
+
+[[example]]
+name = "whisper_smoke"
+path = "examples/whisper_smoke.rs"
+
+[[example]]
+name = "vocals_isolate_smoke"
+path = "examples/vocals_isolate_smoke.rs"
+
+[target."cfg(any(target_os = \"macos\", windows, target_os = \"linux\"))".dependencies]
+tauri-plugin-deep-link = "2"
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
+
+[target."cfg(windows)".dependencies]
+webview2-com = "0.38"
+windows-collections = "0.2"
+windows = { version = "0.61", features = [
+  "Win32_Devices_HumanInterfaceDevice",
+  "Win32_Foundation",
+  "Win32_Graphics_Dxgi",
+  "Win32_Graphics_Gdi",
+  "AI_MachineLearning",
+  "Foundation_Collections",
+  "Win32_System_Com",
+  "Win32_System_LibraryLoader",
+  "Win32_System_ProcessStatus",
+  "Win32_System_SystemInformation",
+  "Win32_System_Threading",
+  "Win32_UI_Input",
+  "Win32_UI_WindowsAndMessaging"
+] }

@@ -1,0 +1,172 @@
+import React from "react";
+import { Box, HStack, Image, Text } from "@chakra-ui/react";
+import { useLocation } from "react-router-dom";
+import { BackLink, type ClipperLayoutBackLink } from "../../../shared/components/back-link.component";
+import { WindowControls } from "../../../shared/components/window-controls.component";
+import { useTauriTitleBarHandlers } from "../../../shared/hooks/use-tauri-title-bar-handlers.hook";
+import { asset } from "../../../shared/utils/asset.util";
+import { isTauri } from "../../../shared/utils/platform.util";
+import { colors, useTheme } from "../../../theme";
+import { AccountHeaderAction } from "../../authentication/components/account-header-action.component";
+
+export interface ClipperLayoutStep {
+  current?: number;
+  total?: number;
+  title: string;
+}
+
+export type { ClipperLayoutBackLink } from "../../../shared/components/back-link.component";
+
+interface ClipperLayoutProps {
+  children: React.ReactNode;
+  /** Contextual step indicator — shown centered in the header bar. */
+  step?: ClipperLayoutStep;
+  /** Overrides the default router back link (e.g. in-session sub-views). */
+  backLink?: ClipperLayoutBackLink;
+  /** Extra content rendered after the logo (e.g. home nav toggle). */
+  headerStartExtra?: React.ReactNode;
+  /** Extra controls rendered before window controls (e.g. settings, logout). */
+  headerActions?: React.ReactNode;
+  /** Remove default content padding (e.g. full-bleed auth screen). */
+  flushContent?: boolean;
+}
+
+export const ClipperLayout: React.FC<ClipperLayoutProps> = ({
+  children,
+  step,
+  backLink,
+  headerStartExtra,
+  headerActions,
+  flushContent = false,
+}) => {
+  const { theme } = useTheme();
+  const location = useLocation();
+  const isSessionPage = /^\/clipper\/[^/]+/.test(location.pathname);
+  const backTo = "/clipper";
+  const backLabel = isSessionPage ? "Back to clipper projects" : "Back to clipper";
+  const titleBarHandlers = useTauriTitleBarHandlers({ excludeSelectors: ["a", "button"] });
+
+  const scrollbarCss = {
+    scrollbarWidth: "thin" as const,
+    scrollbarColor: `${theme.scrollbar.thumb} ${theme.scrollbar.track}`,
+    "&::-webkit-scrollbar": { width: "8px", height: "8px" },
+    "&::-webkit-scrollbar-track": { background: theme.scrollbar.track },
+    "&::-webkit-scrollbar-thumb": {
+      background: theme.scrollbar.thumb,
+      borderRadius: "4px",
+    },
+    "&::-webkit-scrollbar-thumb:hover": {
+      background: colors.purple.medium,
+    },
+  };
+
+  const backLinkElement = backLink ? (
+    <BackLink label={backLink.label} onClick={backLink.onClick} />
+  ) : (
+    <BackLink label={backLabel} to={backTo} />
+  );
+
+  return (
+    <Box
+      h="100%"
+      display="flex"
+      flexDirection="column"
+      overflow="hidden"
+      bg={theme.dashboard.gradientMain}
+      color={theme.text.primary}
+    >
+      <Box
+        borderBottom="1px solid"
+        borderColor={theme.dashboard.border}
+        bg={theme.dashboard.glass}
+        backdropFilter="blur(12px)"
+        flexShrink={0}
+        {...titleBarHandlers}
+      >
+        <Box w="full" py={isTauri() ? 0 : 4} pl={4} pr={isTauri() ? 0 : 4}>
+          <HStack
+            justify="space-between"
+            position="relative"
+            h={isTauri() ? "50px" : "auto"}
+            minH={isTauri() ? undefined : "44px"}
+          >
+            <HStack gap={4} flexShrink={0}>
+              <Image src={asset("/clipper/clipper-logo.png")} alt="Open Clipper" h="28px" objectFit="contain" />
+              {headerStartExtra}
+              {(backLink || isSessionPage) && backLinkElement}
+            </HStack>
+
+            {step ? (
+              <HStack
+                position="absolute"
+                left="50%"
+                transform="translateX(-50%)"
+                gap={2.5}
+                fontSize="sm"
+                pointerEvents="none"
+                maxW="calc(100% - 280px)"
+              >
+                {step.current != null &&
+                step.total != null &&
+                step.current < step.total ? (
+                  <Text
+                    as="span"
+                    fontSize="xs"
+                    fontWeight="bold"
+                    letterSpacing="0.1em"
+                    textTransform="uppercase"
+                    color={theme.text.distinct}
+                    whiteSpace="nowrap"
+                    flexShrink={0}
+                  >
+                    Step {step.current} of {step.total}
+                  </Text>
+                ) : null}
+                <Text
+                  color={theme.text.muted}
+                  fontWeight="medium"
+                  whiteSpace="nowrap"
+                  overflow="hidden"
+                  textOverflow="ellipsis"
+                  display={{ base: "none", sm: "block" }}
+                >
+                  {step.title}
+                </Text>
+              </HStack>
+            ) : null}
+
+            {isTauri() ? (
+              <HStack gap={1} flexShrink={0} alignSelf="stretch" alignItems="center">
+                {headerActions}
+                <AccountHeaderAction />
+                <WindowControls
+                  textColor={theme.text.muted}
+                  btnHoverBg={theme.surface.hover}
+                />
+              </HStack>
+            ) : (
+              <HStack gap={1} flexShrink={0}>
+                {headerActions}
+                <AccountHeaderAction />
+              </HStack>
+            )}
+          </HStack>
+        </Box>
+      </Box>
+
+      <Box flex="1" overflowY="auto" css={scrollbarCss} display="flex" flexDirection="column" minH={0}>
+        <Box
+          w="full"
+          py={flushContent ? 0 : { base: 6, md: 8 }}
+          px={flushContent ? 0 : 4}
+          flex="1"
+          display="flex"
+          flexDirection="column"
+          minH={0}
+        >
+          {children}
+        </Box>
+      </Box>
+    </Box>
+  );
+};

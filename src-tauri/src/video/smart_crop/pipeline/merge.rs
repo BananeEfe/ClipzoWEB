@@ -1,0 +1,286 @@
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::time::Instant;
+
+use super::super::diagnostics;
+use super::super::internal::{FaceResult, ObjectResult};
+use super::super::vision::{NativeVisionDevice, NativeVisionError};
+use super::super::vision_logic::{box_iou, SubjectDetection};
+use super::spool::{decode_face_record, decode_object_record, SpoolOutput};
+use super::types::{
+    NativeFaceSample, NativeImportanceSignalRegion, NativeSubjectSample, NativeVisionProgress,
+};
+use crate::video::tracking::bytetrack::ByteTracker;
+use crate::video::tracking::winml::{
+    face_track_inputs, padded_face_box, pose_track_inputs, subject_track_inputs, tracked_faces,
+    tracked_poses, tracked_subjects,
+};
+
+pub(crate) struct MergeOutput {
+    pub face_samples: Vec<NativeFaceSample>,
+    pub subject_samples: Vec<NativeSubjectSample>,
+    pub face_device: NativeVisionDevice,
+    pub object_device: NativeVisionDevice,
+    pub pose_device: NativeVisionDevice,
+    pub face_inference_ms: u64,
+    pub object_inference_ms: u64,
+    pub pose_inference_ms: u64,
+    pub recovery_face_passes: usize,
+    pub recovery_object_passes: usize,
+    pub tracker_duration_ms: u64,
+    pub tracked_subject_count: usize,
+    pub predicted_subject_count: usize,
+    pub inference_duration_ms: u64,
+    pub merge_duration_ms: u64,
+    pub result_chunk_count: usize,
+}
+
+/// A Tauri `eval` per detected frame is disproportionately expensive on long
+/// clips. Keep chunks small enough for responsive cancellation/UI updates,
+/// while preserving the original sample order and payload exactly.
+const PROGRESS_RESULT_BATCH: usize = 32;
+
+pub(crate) fn merge_samples(
+    sample_count: usize,
+    spool: &SpoolOutput,
+    tracking_enabled: bool,
+    progress: &mut impl FnMut(NativeVisionProgress) -> Result<(), NativeVisionError>,
+) -> Result<MergeOutput, NativeVisionError> {
+    let merge_started = Instant::now();
+    let preserve_raw_pose_observations = sample_count > 0
+        && spool.pose_nonempty_count * 10 >= sample_count * 3
+        && spool.face_nonempty_count * 10 < sample_count * 3;
+    let mut face_lines = BufReader::new(File::open(&spool.face_path).map_err(|error| {
+        NativeVisionError::new(
+            "analysis_storage_failed",
+            format!("Cannot read face analysis spool: {error}"),
+            true,
+        )
+    })?)
+    .lines();
+    let mut object_lines = BufReader::new(File::open(&spool.object_path).map_err(|error| {
+        NativeVisionError::new(
+            "analysis_storage_failed",
+            format!("Cannot read object analysis spool: {error}"),
+            true,
+        )
+    })?)
+    .lines();
+
+    let mut face_samples = Vec::new();
+    let mut subject_samples = Vec::with_capacity(sample_count);
+    let mut face_device = NativeVisionDevice::Cpu;
+    let mut object_device = NativeVisionDevice::Cpu;
+    let mut pose_device = NativeVisionDevice::Cpu;
+    let mut face_inference_ms = 0;
+    let mut object_inference_ms = 0;
+    let mut pose_inference_ms = 0;
+    let mut recovery_face_passes = 0;
+    let mut recovery_object_passes = 0;
+    let tracker_started = Instant::now();
+    let mut object_tracker = ByteTracker::new();
+    let mut face_tracker = ByteTracker::new();
+    let mut pose_tracker = ByteTracker::new();
+    let mut tracked_subject_count = 0usize;
+    let mut predicted_subject_count = 0usize;
+    let mut pending_face_samples = Vec::with_capacity(PROGRESS_RESULT_BATCH / 2);
+    let mut pending_subject_samples = Vec::with_capacity(PROGRESS_RESULT_BATCH);
+    let mut result_chunk_count = 0usize;
+    for index in 0..sample_count {
+        if index == 0 || index % 25 == 0 || index + 1 == sample_count {
+            diagnostics::append(
+                "merge",
+                &format!("processing sample {}/{}", index + 1, sample_count),
+            );
+        }
+        let face: FaceResult = decode_face_record(&read_spool_record(&mut face_lines, "face")?)?;
+        let object: ObjectResult =
+            decode_object_record(&read_spool_record(&mut object_lines, "object")?)?;
+        if face.index != index || object.index != index {
+            return Err(NativeVisionError::new(
+                "analysis_storage_failed",
+                format!("Analysis spool ordering mismatch at sample {index}"),
+                true,
+            ));
+        }
+        face_device = face.device;
+        object_device = object.device;
+        pose_device = object.pose_device;
+        face_inference_ms += face.duration_ms;
+        recovery_face_passes += face.recovery_passes;
+        recovery_object_passes += object.recovery_passes;
+        object_inference_ms += object.duration_ms;
+        pose_inference_ms += object.pose_duration_ms;
+        if tracking_enabled && face.scene_cut {
+            object_tracker.reset();
+            face_tracker.reset();
+            pose_tracker.reset();
+        }
+        let autoflip_faces = if tracking_enabled {
+            tracked_faces(
+                face_tracker.update(face.time, &face_track_inputs(&face.faces)),
+                &face.faces,
+            )
+        } else {
+            face.faces
+                .iter()
+                .filter(|item| item.score >= 0.6)
+                .cloned()
+                .collect()
+        };
+        let pose_subjects = if tracking_enabled {
+            if preserve_raw_pose_observations {
+                object.poses
+            } else {
+                tracked_poses(
+                    pose_tracker.update(object.time, &pose_track_inputs(&object.poses)),
+                    &object.poses,
+                )
+            }
+        } else {
+            object.poses.clone()
+        };
+        let (mut detections, camera_motion_residual) = if tracking_enabled {
+            let tracked = tracked_subjects(
+                object_tracker.update(object.time, &subject_track_inputs(&object.detections)),
+            );
+            tracked_subject_count += tracked.len();
+            predicted_subject_count += tracked
+                .iter()
+                .filter(|item| item.predicted == Some(true))
+                .count();
+            // ByteTrack v2 keeps image-space boxes and deliberately does not
+            // report camera motion without independent background evidence.
+            (tracked, None)
+        } else {
+            (object.detections, None)
+        };
+        for pose in pose_subjects
+            .iter()
+            .filter(|pose| pose.predicted != Some(true) && pose.track_id.is_some())
+        {
+            let overlaps_person = detections.iter().any(|detection| {
+                detection.label.eq_ignore_ascii_case("person")
+                    && box_iou(detection.box_, pose.box_) >= 0.5
+            });
+            if !overlaps_person {
+                detections.push(SubjectDetection {
+                    box_: pose.box_,
+                    label: "person".into(),
+                    score: pose.score,
+                    track_id: pose.track_id,
+                    predicted: pose.predicted,
+                    detector_source: Some("pose"),
+                });
+            }
+        }
+        let importance_signals: Vec<NativeImportanceSignalRegion> = object
+            .motion_signal
+            .into_iter()
+            .map(|(box_, confidence)| NativeImportanceSignalRegion {
+                box_,
+                kind: "motion",
+                confidence,
+            })
+            .collect();
+        let subject = NativeSubjectSample {
+            time: object.time,
+            detections,
+            autoflip_faces,
+            pose_subjects,
+            importance_signals,
+            model_id: "clipper-vision-v5-yolox-s-scrfd10g-tiled",
+            scene_cut: face.scene_cut.then_some(true),
+            camera_motion_residual,
+        };
+        let face_sample = face.face_bucket.then(|| NativeFaceSample {
+            time: face.time,
+            faces: face
+                .faces
+                .iter()
+                .map(|item| padded_face_box(item, face.display_width, face.display_height))
+                .collect(),
+            frame_w: face.display_width,
+            frame_h: face.display_height,
+            scene_cut: face.scene_cut.then_some(true),
+        });
+        if let Some(sample) = face_sample.clone() {
+            face_samples.push(sample);
+        }
+        subject_samples.push(subject.clone());
+        if let Some(sample) = face_sample {
+            pending_face_samples.push(sample);
+        }
+        pending_subject_samples.push(subject);
+        let is_last = index + 1 == sample_count;
+        if pending_subject_samples.len() >= PROGRESS_RESULT_BATCH || is_last {
+            result_chunk_count += 1;
+            let percent = 90 + ((index + 1) * 10 / sample_count.max(1));
+            progress(NativeVisionProgress {
+                phase: "inferencing",
+                percent,
+                timestamp_sec: face.time,
+                eta_seconds: None,
+                face_sample: None,
+                subject_sample: None,
+                face_samples: (!pending_face_samples.is_empty())
+                    .then(|| std::mem::take(&mut pending_face_samples)),
+                subject_samples: (!pending_subject_samples.is_empty())
+                    .then(|| std::mem::take(&mut pending_subject_samples)),
+                queued_detections: sample_count - index - 1,
+            })?;
+        }
+    }
+    diagnostics::append(
+        "merge",
+        &format!(
+            "tracking complete tracked_subjects={tracked_subject_count} predicted_subjects={predicted_subject_count} tracker_ms={}",
+            tracker_started.elapsed().as_millis()
+        ),
+    );
+    let tracker_duration_ms = tracking_enabled
+        .then(|| tracker_started.elapsed().as_millis() as u64)
+        .unwrap_or(0);
+    let inference_duration_ms = face_inference_ms.max(object_inference_ms + pose_inference_ms);
+    Ok(MergeOutput {
+        face_samples,
+        subject_samples,
+        face_device,
+        object_device,
+        pose_device,
+        face_inference_ms,
+        object_inference_ms,
+        pose_inference_ms,
+        recovery_face_passes,
+        recovery_object_passes,
+        tracker_duration_ms,
+        tracked_subject_count,
+        predicted_subject_count,
+        inference_duration_ms,
+        merge_duration_ms: merge_started.elapsed().as_millis() as u64,
+        result_chunk_count,
+    })
+}
+
+fn read_spool_record(
+    lines: &mut std::io::Lines<BufReader<File>>,
+    kind: &str,
+) -> Result<String, NativeVisionError> {
+    let line = lines
+        .next()
+        .ok_or_else(|| {
+            NativeVisionError::new(
+                "analysis_storage_failed",
+                format!("Unexpected end of {kind} analysis spool"),
+                true,
+            )
+        })?
+        .map_err(|error| {
+            NativeVisionError::new(
+                "analysis_storage_failed",
+                format!("Cannot read {kind} analysis spool: {error}"),
+                true,
+            )
+        })?;
+    Ok(line)
+}

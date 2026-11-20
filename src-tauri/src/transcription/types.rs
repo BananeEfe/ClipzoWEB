@@ -1,0 +1,116 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptionWord {
+    pub text: String,
+    pub start_time: f64,
+    pub end_time: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptionSegment {
+    pub id: String,
+    pub start_time: f64,
+    pub end_time: f64,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParakeetTranscriptionResult {
+    pub text: String,
+    pub duration_ms: u64,
+    pub processing_time_ms: u64,
+    pub engine: String,
+    pub provider: String,
+    pub words: Vec<TranscriptionWord>,
+    pub segments: Vec<TranscriptionSegment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParakeetModelStatus {
+    pub installed: bool,
+    pub loaded: bool,
+    pub path: Option<String>,
+    pub provider: Option<String>,
+    pub source: Option<String>,
+    pub manifest_valid: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParakeetCapability {
+    pub available: bool,
+    pub provider: Option<String>,
+    pub model_installed: bool,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParakeetTranscriptionProgress {
+    pub phase: String,
+    pub chunk_index: usize,
+    pub chunk_count: usize,
+    pub ratio: f64,
+    pub provider: Option<String>,
+}
+
+/// Shared progress payload for Parakeet / Whisper native jobs.
+pub type LocalTranscriptionProgress = ParakeetTranscriptionProgress;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParakeetTranscribeRequest {
+    pub audio_path: String,
+    pub language: Option<String>,
+    #[serde(default)]
+    pub isolate_vocals: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WhisperModelStatus {
+    pub installed: bool,
+    pub loaded: bool,
+    pub path: Option<String>,
+    pub provider: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WhisperTranscribeRequest {
+    pub audio_path: String,
+    pub language: Option<String>,
+    #[serde(default)]
+    pub isolate_vocals: bool,
+}
+
+pub type WhisperTranscriptionResult = ParakeetTranscriptionResult;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrepareTranscriptionAudioResult {
+    pub audio_path: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum TranscriptionError {
+    #[error("Local model is not installed")]
+    ModelNotInstalled,
+
+    #[error("Failed to load model: {0}")]
+    ModelLoad(String),
+
+    #[error("Invalid audio: {0}")]
+    InvalidAudio(String),
+
+    #[error("Inference error: {0}")]
+    Inference(String),
+
+    #[error("Transcription was cancelled")]
+    Cancelled,
+}

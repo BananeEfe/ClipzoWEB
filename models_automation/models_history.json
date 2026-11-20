@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "promotions": [
+    {
+      "promotedAt": "2026-07-17T11:36:28Z",
+      "manifestSha256": "a066499888e77bc5027d54ff63590de5807ccf3327a8dc77ef1a4e62832a02aa",
+      "fileCount": 15,
+      "totalSize": 711802798,
+      "cdnBaseUrl": "https://models.openclipper.grepcut.com/v1"
+    },
+    {
+      "promotedAt": "2026-07-17T11:41:07Z",
+      "manifestSha256": "1c9ea6ec83ce8c7e6c01d422aa9ed4cd7d1dc9350342908a01982fadb37c6007",
+      "fileCount": 15,
+      "totalSize": 711802798,
+      "cdnBaseUrl": "https://models.openclipper.grepcut.com/v1"
+    },
+    {
+      "promotedAt": "2026-07-19T18:05:41Z",
+      "manifestSha256": "1c9ea6ec83ce8c7e6c01d422aa9ed4cd7d1dc9350342908a01982fadb37c6007",
+      "fileCount": 15,
+      "totalSize": 711802798,
+      "cdnBaseUrl": "https://models.openclipper.grepcut.com/v1"
+    },
+    {
+      "promotedAt": "2026-07-28T18:09:48Z",
+      "manifestSha256": "27dde9c5c9039945ffe3ab8347e33088ee0a93656b5830a8feabd795f52f0626",
+      "fileCount": 13,
+      "totalSize": 2425471355,
+      "cdnBaseUrl": "https://models.openclipper.grepcut.com/v1"
+    },
+    {
+      "promotedAt": "2026-07-28T19:15:06Z",
+      "manifestSha256": "3671ad2eacc927c93d21222a8d74ec6f69da3ad007f9a71e29f9de7e06505d2f",
+      "fileCount": 13,
+      "totalSize": 2425468006,
+      "cdnBaseUrl": "https://models.openclipper.grepcut.com/v1"
+    },
+    {
+      "promotedAt": "2026-08-01T08:16:58Z",
+      "manifestSha256": "50bea177b2ca377441336d86841d6781916822991ac49e1a5a35ea09d4fa5745",
+      "fileCount": 5,
+      "totalSize": 670479304,
+      "cdnBaseUrl": "https://models.openclipper.grepcut.com/v1"
+    },
+    {
+      "promotedAt": "2026-08-01T08:20:19Z",
+      "manifestSha256": "050943e875ecf8092d590e9339cd9f0358df619e9b0cc192936c5d063f36ae96",
+      "fileCount": 11,
+      "totalSize": 1773978491,
+      "cdnBaseUrl": "https://models.openclipper.grepcut.com/v1"
+    }
+  ]
+}

@@ -1,0 +1,216 @@
+use crate::video::ffmpeg::frames::{extract_clipper_segment_blocking, snap_to_keyframe_blocking};
+use crate::video::jobs::registry::{NativeJobEmitter, NativeJobRegistry};
+use std::sync::atomic::Ordering;
+use tauri::{command, AppHandle, Manager, State, WebviewWindow};
+
+#[command]
+pub fn start_clipper_media_repair(
+    app: AppHandle, webview: WebviewWindow, jobs: State<'_, NativeJobRegistry>,
+    session_id: String, job_id: String, project_id: String, file_path: String,
+) -> Result<(), String> {
+    #[cfg(not(windows))]
+    { let _ = (app, webview, jobs, session_id, job_id, project_id, file_path); Err("Media recovery requires Windows.".into()) }
+    #[cfg(windows)]
+    {
+        let directory = crate::clipper::data::clipper_project_data_dir(&app, &project_id)?;
+        let cancelled = jobs.register(&session_id, &job_id)?;
+        let registry = jobs.inner().clone();
+        let emitter = NativeJobEmitter::new(webview, session_id.clone(), job_id.clone(), cancelled.clone());
+        tauri::async_runtime::spawn(async move {
+            let task_emitter = emitter.clone();
+            let result = tauri::async_runtime::spawn_blocking(move || {
+                let mut last = std::time::Instant::now() - std::time::Duration::from_secs(1);
+                crate::video::ffmpeg::compatible_media::prepare(
+                    std::path::Path::new(&file_path), &directory, &cancelled,
+                    |ratio| {
+                        if ratio == 1.0 || last.elapsed().as_millis() >= 250 {
+                            task_emitter.progress(&serde_json::json!({"ratio": ratio}))?;
+                            last = std::time::Instant::now();
+                        }
+                        Ok(())
+                    },
+                )
+            }).await;
+            match result {
+                Ok(Ok(media)) => { let _ = emitter.result(&media); },
+                Ok(Err(message)) => { let _ = emitter.error(&serde_json::json!({"code": "media_repair_failed", "message": message})); },
+                Err(error) => { let _ = emitter.error(&serde_json::json!({"code": "media_repair_failed", "message": error.to_string()})); },
+            }
+            registry.finish(&session_id, &job_id);
+        });
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+#[command]
+pub fn start_clipper_winml_analysis(
+    session_id: String,
+    job_id: String,
+    file_path: String,
+    start_time: f64,
+    end_time: f64,
+    tracking_mode: Option<String>,
+    vision_ablation: Option<crate::video::smart_crop::pipeline::VisionAblationConfig>,
+    app_handle: AppHandle,
+    webview: WebviewWindow,
+    jobs: State<'_, NativeJobRegistry>,
+) -> Result<(), String> {
+    let resource_dir = app_handle
+        .path()
+        .resource_dir()
+        .map_err(|error| format!("Cannot resolve resource directory: {error}"))?;
+    let registry = jobs.inner().clone();
+    let cancelled = registry.register(&session_id, &job_id)?;
+    let emitter = NativeJobEmitter::new(
+        webview,
+        session_id.clone(),
+        job_id.clone(),
+        cancelled.clone(),
+    );
+    let task_emitter = emitter.clone();
+    let task_cancelled = cancelled.clone();
+    let finish_registry = registry.clone();
+    let finish_session_id = session_id.clone();
+    let finish_job_id = job_id.clone();
+    let tracking_enabled = tracking_mode.as_deref().unwrap_or("bytetrack-v2") != "off";
+    let vision_ablation = vision_ablation.unwrap_or_default();
+
+    tauri::async_runtime::spawn(async move {
+        let joined = tauri::async_runtime::spawn_blocking(move || {
+            crate::video::smart_crop::pipeline::analyze(
+                file_path,
+                start_time,
+                end_time,
+                &resource_dir,
+                task_cancelled,
+                tracking_enabled,
+                vision_ablation,
+                |progress| {
+                    task_emitter.progress(&progress).map_err(|error| {
+                        crate::video::smart_crop::vision::NativeVisionError::new(
+                            "cancelled",
+                            error,
+                            false,
+                        )
+                    })
+                },
+            )
+        })
+        .await;
+
+        match joined {
+            Ok(Ok(summary)) if !cancelled.load(Ordering::Acquire) => {
+                crate::video::smart_crop::diagnostics::append(
+                    "command",
+                    "emitting successful native analysis result",
+                );
+                let emitted = emitter.result(&summary);
+                crate::video::smart_crop::diagnostics::append(
+                    "command",
+                    &format!("native analysis result emitted ok={}", emitted.is_ok()),
+                );
+            }
+            Ok(Ok(_)) => {
+                crate::video::smart_crop::diagnostics::append(
+                    "command",
+                    "successful native analysis result suppressed after cancellation",
+                );
+            }
+            Ok(Err(error)) if error.code == "cancelled" => {
+                crate::video::smart_crop::diagnostics::append(
+                    "command",
+                    &format!(
+                        "native analysis cancellation acknowledged message={}",
+                        error.message
+                    ),
+                );
+            }
+            Ok(Err(error)) => {
+                crate::video::smart_crop::diagnostics::append(
+                    "command",
+                    &format!(
+                        "emitting error code={} fatal={} message={}",
+                        error.code, error.fatal, error.message
+                    ),
+                );
+                let emitted = emitter.error(&error);
+                crate::video::smart_crop::diagnostics::append(
+                    "command",
+                    &format!("native analysis error emitted ok={}", emitted.is_ok()),
+                );
+            }
+            Err(error) if !cancelled.load(Ordering::Acquire) => {
+                crate::video::smart_crop::diagnostics::append(
+                    "command",
+                    &format!("spawn_blocking join error: {error}"),
+                );
+                let failure = crate::video::smart_crop::vision::NativeVisionError::new(
+                    "evaluation_failed",
+                    format!("Native task join error: {error}"),
+                    true,
+                );
+                let emitted = emitter.error(&failure);
+                crate::video::smart_crop::diagnostics::append(
+                    "command",
+                    &format!("native task join error emitted ok={}", emitted.is_ok()),
+                );
+            }
+            Err(error) => {
+                crate::video::smart_crop::diagnostics::append(
+                    "command",
+                    &format!("spawn_blocking join error suppressed after cancellation: {error}"),
+                );
+            }
+        }
+        finish_registry.finish(&finish_session_id, &finish_job_id);
+    });
+    Ok(())
+}
+
+#[cfg(not(windows))]
+#[command]
+pub fn start_clipper_winml_analysis(
+    _session_id: String,
+    _job_id: String,
+    _file_path: String,
+    _start_time: f64,
+    _end_time: f64,
+    _tracking_mode: Option<String>,
+    _vision_ablation: Option<serde_json::Value>,
+    _app_handle: AppHandle,
+    _webview: WebviewWindow,
+    _jobs: State<'_, NativeJobRegistry>,
+) -> Result<(), String> {
+    Err("WinML is unavailable on this platform.".into())
+}
+
+#[command]
+pub fn cancel_clipper_native_job(
+    session_id: String,
+    job_id: String,
+    jobs: State<'_, NativeJobRegistry>,
+) -> bool {
+    jobs.cancel(&session_id, &job_id)
+}
+
+#[command]
+pub async fn snap_clipper_to_keyframe(file_path: String, start_time: f64) -> Result<f64, String> {
+    tokio::task::spawn_blocking(move || snap_to_keyframe_blocking(file_path, start_time))
+        .await
+        .map_err(|e| format!("Task join error: {e}"))?
+}
+
+#[command]
+pub async fn extract_clipper_segment(
+    file_path: String,
+    start_time: f64,
+    end_time: f64,
+) -> Result<tauri::ipc::Response, String> {
+    let bytes = tokio::task::spawn_blocking(move || {
+        extract_clipper_segment_blocking(file_path, start_time, end_time)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {e}"))??;
+    Ok(tauri::ipc::Response::new(bytes))
+}

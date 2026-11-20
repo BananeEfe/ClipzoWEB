@@ -1,0 +1,43 @@
+import type { Project } from "../../../services/projects.service";
+import type { ClipperLayoutBackLink } from "../../../shared/components/back-link.component";
+import type { ClipperLoadedProject } from "../hooks/use-clipper-project-loader.hook";
+
+export interface ClipperSessionViewProps {
+  project: Project;
+  token: string | null;
+  loaded: ClipperLoadedProject | null;
+}
+
+export type SessionViewMode = "preview" | "queue" | "rendering" | "exports";
+
+export interface ClipperSessionVisibility {
+  showUpload: boolean;
+  showRestoreLoader: boolean;
+  showFreshProcessing: boolean;
+  showLoadingUi: boolean;
+  /** Preview panel should be visible for the current view. */
+  showPreview: boolean;
+  /** Keep preview panel mounted (CSS-hidden) across queue/exports to avoid remount flash. */
+  previewKeepAlive: boolean;
+  showQueue: boolean;
+  showExports: boolean;
+  showQueueSetup: boolean;
+  showQueueProgress: boolean;
+}
+
+export interface ClipperSessionLayoutState extends ClipperSessionVisibility {
+  layoutBackLink?: ClipperLayoutBackLink;
+}
+
+export interface ClipperSessionVisibilityInput {
+  stage: import("./stages.util").ClipperStage;
+  view: SessionViewMode;
+  isRendering: boolean;
+  exportCount: number;
+  loaded: ClipperLoadedProject | null;
+  clipPreviewsLength: number;
+  autoPartsClipPreviewsLength: number | undefined;
+  rangeTrimmedVideoUrl: string | null;
+  onBackToPreview: () => void;
+  onBackToRenderQueue: () => void;
+}

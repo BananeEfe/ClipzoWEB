@@ -1,0 +1,284 @@
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Box, VStack } from "@chakra-ui/react";
+import { deriveRegionsFromLayoutTracks } from "../../engine/reframe/collage";
+import type { ClipperClipSegmentWindow } from "../../engine/segmentation";
+import { useClipperPreviewPlayback } from "../../hooks/use-clipper-preview-playback.hook";
+import { useClipperBrandingLogo } from "../../hooks/use-clipper-branding-logo.hook";
+import { activeClipPreviewsForMode } from "../../hooks/clipper-pipeline/clip-preview.util";
+import { CLIPPER_TRIMMED_SEGMENT_FILE } from "../../platform/native-source.util";
+import {
+  buildClipperStudioImport,
+  openClipInStudio,
+  type OpenInStudioProgress,
+} from "../../lib/studio-import/build-studio-import.util";
+import type { ClipperStudioImport } from "../../lib/studio-import/clipper-studio-import.types";
+import { readClipperSmartCropAnalysis } from "../../persistence/project-data-files.util";
+import { CLIPPER_FORMAT_DEFS } from "../../shared/formats.util";
+import { useClipperUi } from "../../shared/use-clipper-ui.hook";
+import { appToast } from "../../../../shared/utils/toast.service";
+import type { ClipperFrameContext } from "../../engine/types/render.types";
+import { ClipperSettingsDrawer, type ClipperSettingsDrawerPanel } from "../clipper-settings-drawer.component";
+import { ClipperPreviewFormatsFooter } from "./formats-footer.component";
+import { ClipperPreviewHeroSection } from "./hero-section.component";
+import { OpenInStudioProgressModal } from "./open-in-studio-progress-modal.component";
+import { ClipperPreviewSidePanel } from "./side-panel.component";
+import type { ClipperPreviewProps } from "./clipper-preview.types";
+
+export type { ClipperPreviewProps } from "./clipper-preview.types";
+
+export const ClipperPreview: React.FC<ClipperPreviewProps> = (props) => {
+  const {
+    projectId,
+    rangeTrimmedVideoUrl,
+    autoPartsClipPreviews,
+    aiClipPreviews,
+    manualClipPreviews,
+    clipSourceMode,
+    activeClipIndex,
+    onSelectClip,
+    settings,
+    onUpdateSettings,
+    getFrameContext,
+    sourceFileName,
+    settingsDrawerVisible = true,
+    onOpenInStudio: onOpenInStudioProp,
+  } = props;
+
+  const { theme } = useClipperUi();
+  const [activeSettingsPanel, setActiveSettingsPanel] = useState<ClipperSettingsDrawerPanel | null>(null);
+  const [openingInStudio, setOpeningInStudio] = useState(false);
+  const [studioOpenProgress, setStudioOpenProgress] = useState<OpenInStudioProgress | null>(null);
+  const openingInStudioRef = useRef(false);
+
+  useEffect(() => {
+    if (!settingsDrawerVisible) {
+      setActiveSettingsPanel(null);
+    }
+  }, [settingsDrawerVisible]);
+  const safeAutoPartsPreviews = autoPartsClipPreviews ?? [];
+  const safeAiPreviews = aiClipPreviews ?? [];
+  const safeManualPreviews = manualClipPreviews ?? [];
+  const heroPreviews = activeClipPreviewsForMode(
+    clipSourceMode,
+    safeAutoPartsPreviews,
+    safeAiPreviews,
+    safeManualPreviews,
+  );
+  const activePreview =
+    heroPreviews.find((p) => p.clip.index === activeClipIndex) ?? heroPreviews[0];
+  const activeClip = activePreview?.clip;
+  const clipStartSec = activeClip?.startSec ?? 0;
+  const clipEndSec = activeClip?.endSec ?? 60;
+  const clipDuration = activeClip?.durationSec ?? 60;
+  const clipSegments: ClipperClipSegmentWindow[] = activeClip?.segments?.length
+    ? activeClip.segments
+    : [{ startSec: clipStartSec, endSec: clipEndSec }];
+  const playbackStart = clipSegments[0]?.startSec ?? clipStartSec;
+  const playbackEnd = clipSegments.at(-1)?.endSec ?? clipEndSec;
+
+  const previewFormats = CLIPPER_FORMAT_DEFS;
+
+  const primaryFormat = useMemo(() => {
+    const vertical = previewFormats.find((f) => f.aspectId === "9-16");
+    return vertical ?? previewFormats[0];
+  }, [previewFormats]);
+
+  const secondaryFormats = useMemo(
+    () => previewFormats.filter((f) => f.id !== primaryFormat?.id),
+    [previewFormats, primaryFormat?.id],
+  );
+
+  const smartCropAnalysis = getFrameContext()?.smartCropAnalysis ?? null;
+  const collageRegions = useMemo(
+    () => deriveRegionsFromLayoutTracks(smartCropAnalysis),
+    [smartCropAnalysis],
+  );
+
+  const { epoch: brandingLogoEpoch } = useClipperBrandingLogo(
+    settings.branding.kind === "logo" ? settings.branding.imagePath : null,
+  );
+
+  const { videoRef, registerCanvas, previewRegionRef, togglePlay, seekToTranscriptTime } =
+    useClipperPreviewPlayback({
+      rangeTrimmedVideoUrl,
+      previewActive: settingsDrawerVisible,
+      activeClipIndex,
+      clipStartSec,
+      clipEndSec,
+      clipDuration,
+      clipSegments,
+      playbackStart,
+      playbackEnd,
+      previewFormats,
+      primaryFormat,
+      getFrameContext,
+      settings,
+      brandingLogoEpoch,
+      onSelectClip,
+    });
+
+  const handleOpenInStudio = useCallback(
+    (clipIndex: number) => {
+      if (openingInStudioRef.current) return;
+      void (async () => {
+        let started = false;
+        try {
+          if (onOpenInStudioProp) {
+            onOpenInStudioProp(clipIndex);
+            return;
+          }
+
+          const preview = heroPreviews.find((p) => p.clip.index === clipIndex);
+          if (!preview) {
+            appToast.error(
+              "No clip found",
+              `Could not find clip #${clipIndex + 1} to open in Studio.`,
+            );
+            return;
+          }
+
+          openingInStudioRef.current = true;
+          started = true;
+          setOpeningInStudio(true);
+          setStudioOpenProgress({ phase: "preparing", ratio: 0 });
+
+          const contextForClip = getFrameContext(clipIndex);
+          let analysis = contextForClip?.smartCropAnalysis ?? null;
+
+          if (!analysis && projectId) {
+            try {
+              const fromDisk = await readClipperSmartCropAnalysis(projectId);
+              if (fromDisk) {
+                analysis = fromDisk;
+              }
+            } catch {
+            }
+          }
+
+          const frameContext: ClipperFrameContext | null = contextForClip
+            ? { ...contextForClip, smartCropAnalysis: analysis }
+            : null;
+
+          const videoHint = CLIPPER_TRIMMED_SEGMENT_FILE;
+          let manifest: ClipperStudioImport;
+          try {
+            manifest = buildClipperStudioImport({
+              clip: preview.clip,
+              settings,
+              frameContext,
+              sourceVideoFileName: videoHint,
+              sourceSize: {
+                width: videoRef.current?.videoWidth ?? 0,
+                height: videoRef.current?.videoHeight ?? 0,
+              },
+              preferredFormatId: primaryFormat?.id,
+            });
+          } catch (error) {
+            appToast.error(
+              "Could not open Studio",
+              error instanceof Error ? error.message : String(error),
+            );
+            return;
+          }
+          await openClipInStudio(manifest, {
+            projectId,
+            onProgress: setStudioOpenProgress,
+          });
+        } catch {
+        } finally {
+          if (started) {
+            openingInStudioRef.current = false;
+            setOpeningInStudio(false);
+            setStudioOpenProgress(null);
+          }
+        }
+      })();
+    },
+    [
+      onOpenInStudioProp,
+      projectId,
+      heroPreviews,
+      getFrameContext,
+      settings,
+      primaryFormat?.id,
+      videoRef,
+    ],
+  );
+
+  const pausePreview = useCallback(() => {
+    videoRef.current?.pause();
+  }, [videoRef]);
+
+  return (
+    <VStack align="stretch" gap={4}>
+      <Box
+        position="fixed"
+        width="1px"
+        height="1px"
+        opacity={0}
+        pointerEvents="none"
+        left="-9999px"
+        aria-hidden
+      >
+        <video
+          ref={videoRef}
+          preload="metadata"
+          playsInline
+        />
+      </Box>
+
+      <Box
+        ref={previewRegionRef}
+        w="full"
+        position="relative"
+        display={{ base: "flex", lg: "block" }}
+        flexDirection={{ base: "column" }}
+        gap={{ base: 8, lg: 0 }}
+      >
+        <ClipperPreviewHeroSection
+          videoRef={videoRef}
+          registerCanvas={registerCanvas}
+          primaryFormat={primaryFormat}
+          clipSegments={clipSegments}
+          clipDuration={clipDuration}
+          activeClipIndex={activeClipIndex}
+          sourceFileName={sourceFileName}
+          theme={theme}
+          onTogglePlay={togglePlay}
+        />
+
+        <ClipperPreviewSidePanel
+          {...props}
+          theme={theme}
+          safeAutoPartsPreviews={safeAutoPartsPreviews}
+          safeAiPreviews={safeAiPreviews}
+          safeManualPreviews={safeManualPreviews}
+          collageRegions={collageRegions}
+          seekToTranscriptTime={seekToTranscriptTime}
+          pausePreview={pausePreview}
+          onOpenInStudio={handleOpenInStudio}
+          openingInStudio={openingInStudio}
+        />
+      </Box>
+
+      <ClipperPreviewFormatsFooter
+        secondaryFormats={secondaryFormats}
+        registerCanvas={registerCanvas}
+      />
+
+      <OpenInStudioProgressModal
+        isOpen={openingInStudio}
+        progress={studioOpenProgress}
+      />
+
+      <ClipperSettingsDrawer
+        activePanel={activeSettingsPanel}
+        onActivePanelChange={setActiveSettingsPanel}
+        settings={settings}
+        words={activeClip?.words ?? []}
+        onUpdateSettings={onUpdateSettings}
+        visible={settingsDrawerVisible}
+      />
+    </VStack>
+  );
+};

@@ -1,0 +1,385 @@
+//! Shared WinML pipeline constants and internal frame/result types.
+
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
+
+use super::vision::{NativeVisionDevice, NativeVisionError, BATCH_BOUND};
+use super::vision_logic::{AutoFlipFaceDetection, NormalizedBox, PoseSubject, SubjectDetection};
+
+// Match the 200 ms feature cadence used by the reference MediaPipe AutoFlip
+// graph. At 3.5 FPS a downhill rider can cross a portrait crop between two
+// observations before ByteTrack has enough evidence to confirm it.
+pub(crate) const DETECTION_FPS: f64 = 5.0;
+pub(crate) const FACE_BUCKET_INTERVAL: f64 = 0.5;
+pub(crate) const QUEUE_CAPACITY: usize = 16;
+/// Maximum number of full-resolution RGB frames that may remain alive in the
+/// object pipeline, including detection, ordered policy, pose, recovery, and
+/// final spooling. Each base frame keeps one permit for its entire lifecycle.
+pub(crate) const OBJECT_FRAME_CAPACITY: usize = QUEUE_CAPACITY + MAX_BATCH;
+/// Frames evaluated per WinML call. Workers batch greedily (whatever is
+/// queued, up to this bound) and always pad the tensor to the bound, because
+/// sessions are compiled for exactly this batch size (see BATCH_BOUND).
+pub(crate) const MAX_BATCH: usize = BATCH_BOUND;
+
+/// One worker per model: batched evaluation saturates the device on its own,
+/// and extra concurrent sessions only inflate per-call latency by queueing
+/// against each other on the GPU.
+pub(crate) const FACE_WORKERS: usize = 1;
+pub(crate) const OBJECT_WORKERS: usize = 1;
+/** Pose is a contextual fallback, not an unconditional second full detector. */
+pub(crate) const POSE_PERSON_SAMPLE_STRIDE: usize = 5;
+pub(crate) const POSE_RECOVERY_SAMPLE_STRIDE: usize = 3;
+pub(crate) const POSE_PERSON_CONFIDENCE: f32 = 0.25;
+
+/// Benchmark-only switches used to prove whether expensive recovery passes can
+/// be removed without changing the final crop geometry. Production callers use
+/// the all-false default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VisionAblationConfig {
+    #[serde(default)]
+    pub disable_object_tile_recovery: bool,
+    #[serde(default)]
+    pub disable_face_tile_recovery: bool,
+}
+
+#[derive(Default)]
+pub(crate) struct WorkerMetrics {
+    pub face_base_inference_ms: AtomicU64,
+    pub face_recovery_inference_ms: AtomicU64,
+    pub object_base_inference_ms: AtomicU64,
+    pub object_recovery_inference_ms: AtomicU64,
+    pub pose_base_inference_ms: AtomicU64,
+    pub base_pose_passes: AtomicUsize,
+    pub face_inference_calls: AtomicUsize,
+    pub face_multiframe_inference_calls: AtomicUsize,
+    pub face_full_batch_count: AtomicUsize,
+    pub face_inference_frames: AtomicUsize,
+    pub face_batch_collect_wait_ms: AtomicU64,
+    pub object_preprocess_time_us: AtomicU64,
+    pub object_decode_time_us: AtomicU64,
+    pub zero_copy_tile_count: AtomicUsize,
+    pub zero_copy_tile_bytes_avoided: AtomicU64,
+    pub yolox_fast_decode_skipped_rows: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct WorkerMetricSnapshot {
+    pub face_base_inference_ms: u64,
+    pub face_recovery_inference_ms: u64,
+    pub object_base_inference_ms: u64,
+    pub object_recovery_inference_ms: u64,
+    pub pose_base_inference_ms: u64,
+    pub base_pose_passes: usize,
+    pub face_inference_calls: usize,
+    pub face_multiframe_inference_calls: usize,
+    pub face_full_batch_count: usize,
+    pub face_inference_frames: usize,
+    pub face_batch_collect_wait_ms: u64,
+    pub object_preprocess_time_us: u64,
+    pub object_decode_time_us: u64,
+    pub zero_copy_tile_count: usize,
+    pub zero_copy_tile_bytes_avoided: u64,
+    pub yolox_fast_decode_skipped_rows: u64,
+}
+
+impl WorkerMetrics {
+    pub(crate) fn snapshot(&self) -> WorkerMetricSnapshot {
+        WorkerMetricSnapshot {
+            face_base_inference_ms: self.face_base_inference_ms.load(Ordering::Relaxed),
+            face_recovery_inference_ms: self.face_recovery_inference_ms.load(Ordering::Relaxed),
+            object_base_inference_ms: self.object_base_inference_ms.load(Ordering::Relaxed),
+            object_recovery_inference_ms: self.object_recovery_inference_ms.load(Ordering::Relaxed),
+            pose_base_inference_ms: self.pose_base_inference_ms.load(Ordering::Relaxed),
+            base_pose_passes: self.base_pose_passes.load(Ordering::Relaxed),
+            face_inference_calls: self.face_inference_calls.load(Ordering::Relaxed),
+            face_multiframe_inference_calls: self
+                .face_multiframe_inference_calls
+                .load(Ordering::Relaxed),
+            face_full_batch_count: self.face_full_batch_count.load(Ordering::Relaxed),
+            face_inference_frames: self.face_inference_frames.load(Ordering::Relaxed),
+            face_batch_collect_wait_ms: self.face_batch_collect_wait_ms.load(Ordering::Relaxed),
+            object_preprocess_time_us: self.object_preprocess_time_us.load(Ordering::Relaxed),
+            object_decode_time_us: self.object_decode_time_us.load(Ordering::Relaxed),
+            zero_copy_tile_count: self.zero_copy_tile_count.load(Ordering::Relaxed),
+            zero_copy_tile_bytes_avoided: self.zero_copy_tile_bytes_avoided.load(Ordering::Relaxed),
+            yolox_fast_decode_skipped_rows: self
+                .yolox_fast_decode_skipped_rows
+                .load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContentRect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeFaceBox {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+#[derive(Clone)]
+pub(crate) struct AnalysisFrame {
+    pub index: usize,
+    pub time: f64,
+    pub width: u32,
+    pub height: u32,
+    pub display_width: u32,
+    pub display_height: u32,
+    pub rgb: Vec<u8>,
+    pub face_bucket: bool,
+    pub scene_cut: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FrameRegion {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+pub(crate) struct ObjectFramePermit {
+    return_sender: crossbeam_channel::Sender<()>,
+}
+
+impl ObjectFramePermit {
+    pub(crate) fn new(return_sender: crossbeam_channel::Sender<()>) -> Self {
+        Self { return_sender }
+    }
+}
+
+impl Drop for ObjectFramePermit {
+    fn drop(&mut self) {
+        // Cleanup must never block a worker. A full channel would mean that a
+        // token was duplicated, so ignoring TrySendError::Full is safest.
+        let _ = self.return_sender.try_send(());
+    }
+}
+
+pub(crate) struct FaceResult {
+    pub index: usize,
+    pub time: f64,
+    pub faces: Vec<AutoFlipFaceDetection>,
+    pub display_width: u32,
+    pub display_height: u32,
+    pub face_bucket: bool,
+    pub scene_cut: bool,
+    pub device: NativeVisionDevice,
+    pub duration_ms: u64,
+    pub recovery_passes: usize,
+}
+
+pub(crate) struct ObjectResult {
+    pub index: usize,
+    pub time: f64,
+    pub detections: Vec<SubjectDetection>,
+    pub poses: Vec<PoseSubject>,
+    pub motion_signal: Option<(NormalizedBox, f32)>,
+    pub device: NativeVisionDevice,
+    pub pose_device: NativeVisionDevice,
+    pub duration_ms: u64,
+    pub pose_duration_ms: u64,
+    pub recovery_passes: usize,
+}
+
+pub(crate) enum WorkerResult {
+    Face(FaceResult),
+    Object(ObjectResult),
+    Error(NativeVisionError),
+}
+
+/// Work item for the face session: either the base pass over a sampled frame
+/// or one high-detail tile cropped from it.
+pub(crate) struct FaceJob {
+    pub frame: Arc<AnalysisFrame>,
+    pub region: Option<FrameRegion>,
+    pub kind: FaceJobKind,
+}
+
+pub(crate) enum FaceJobKind {
+    Base,
+    Tile {
+        base_index: usize,
+        offset_x: f32,
+        offset_y: f32,
+        span_x: f32,
+        span_y: f32,
+    },
+}
+
+pub(crate) struct BaseFaceOutcome {
+    pub frame: Arc<AnalysisFrame>,
+    pub faces: Vec<AutoFlipFaceDetection>,
+    pub device: NativeVisionDevice,
+    pub duration_ms: u64,
+}
+
+pub(crate) enum FaceWorkerMsg {
+    Base(BaseFaceOutcome),
+    Tile {
+        base_index: usize,
+        faces: Vec<AutoFlipFaceDetection>,
+        duration_ms: u64,
+    },
+    /// Sent by the decode loop once all frames were queued, so the policy
+    /// thread knows when the last base frame has been finalized.
+    Total(usize),
+    Error(NativeVisionError),
+}
+
+pub(crate) struct PendingRecovery {
+    pub base: BaseFaceOutcome,
+    pub collected: Vec<AutoFlipFaceDetection>,
+    pub remaining: usize,
+    pub pass_count: usize,
+    pub extra_duration_ms: u64,
+}
+
+/// Work item for the object session: base YOLOX pass, high-detail tile, or
+/// final pose/motion publish.
+pub(crate) struct ObjectJob {
+    pub kind: ObjectJobKind,
+}
+
+pub(crate) enum ObjectJobKind {
+    Base {
+        frame: Arc<AnalysisFrame>,
+        permit: ObjectFramePermit,
+    },
+    Tile {
+        frame: Arc<AnalysisFrame>,
+        region: Option<FrameRegion>,
+        base_index: usize,
+        offset_x: f32,
+        offset_y: f32,
+        span_x: f32,
+        span_y: f32,
+    },
+    Finalize {
+        frame: Arc<AnalysisFrame>,
+        permit: ObjectFramePermit,
+        detections: Vec<SubjectDetection>,
+        recovery_passes: usize,
+        yolox_extra_ms: u64,
+        yolox_duration_ms: u64,
+        device: NativeVisionDevice,
+    },
+}
+
+pub(crate) struct BaseObjectOutcome {
+    pub frame: Arc<AnalysisFrame>,
+    pub permit: ObjectFramePermit,
+    pub detections: Vec<SubjectDetection>,
+    pub device: NativeVisionDevice,
+    pub duration_ms: u64,
+}
+
+pub(crate) struct FinalizedObjectBase {
+    pub frame: Arc<AnalysisFrame>,
+    pub _permit: ObjectFramePermit,
+    pub detections: Vec<SubjectDetection>,
+    pub poses: Vec<PoseSubject>,
+    pub motion_signal: Option<(NormalizedBox, f32)>,
+    pub device: NativeVisionDevice,
+    pub pose_device: NativeVisionDevice,
+    pub duration_ms: u64,
+    pub pose_duration_ms: u64,
+    pub recovery_passes: usize,
+}
+
+pub(crate) enum ObjectWorkerMsg {
+    Base(BaseObjectOutcome),
+    Tile {
+        base_index: usize,
+        detections: Vec<SubjectDetection>,
+        duration_ms: u64,
+    },
+    FinalizedBase(FinalizedObjectBase),
+    Total(usize),
+    Error(NativeVisionError),
+}
+
+pub(crate) struct PendingObjectRecovery {
+    pub base: BaseObjectOutcome,
+    pub collected: Vec<SubjectDetection>,
+    pub remaining: usize,
+    pub pass_count: usize,
+    pub extra_duration_ms: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ObjectFramePermit, WorkerMetrics};
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn object_frame_permit_returns_exactly_one_lifecycle_token() {
+        let (sender, receiver) = crossbeam_channel::bounded(2);
+        sender.send(()).unwrap();
+        sender.send(()).unwrap();
+
+        receiver.recv().unwrap();
+        let first = ObjectFramePermit::new(sender.clone());
+        receiver.recv().unwrap();
+        let second = ObjectFramePermit::new(sender);
+        assert!(receiver.try_recv().is_err());
+
+        drop(first);
+        receiver.recv().unwrap();
+        assert!(receiver.try_recv().is_err());
+
+        drop(second);
+        receiver.recv().unwrap();
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn worker_metric_snapshot_includes_face_batch_metrics() {
+        let metrics = WorkerMetrics::default();
+        metrics.face_inference_calls.store(5, Ordering::Relaxed);
+        metrics
+            .face_multiframe_inference_calls
+            .store(3, Ordering::Relaxed);
+        metrics.face_full_batch_count.store(2, Ordering::Relaxed);
+        metrics.face_inference_frames.store(17, Ordering::Relaxed);
+        metrics
+            .face_batch_collect_wait_ms
+            .store(250, Ordering::Relaxed);
+        metrics
+            .object_preprocess_time_us
+            .store(12_345, Ordering::Relaxed);
+        metrics
+            .object_decode_time_us
+            .store(6_789, Ordering::Relaxed);
+        metrics.zero_copy_tile_count.store(7, Ordering::Relaxed);
+        metrics
+            .zero_copy_tile_bytes_avoided
+            .store(8_601_600, Ordering::Relaxed);
+        metrics
+            .yolox_fast_decode_skipped_rows
+            .store(10, Ordering::Relaxed);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.face_inference_calls, 5);
+        assert_eq!(snapshot.face_multiframe_inference_calls, 3);
+        assert_eq!(snapshot.face_full_batch_count, 2);
+        assert_eq!(snapshot.face_inference_frames, 17);
+        assert_eq!(snapshot.face_batch_collect_wait_ms, 250);
+        assert_eq!(snapshot.object_preprocess_time_us, 12_345);
+        assert_eq!(snapshot.object_decode_time_us, 6_789);
+        assert_eq!(snapshot.zero_copy_tile_count, 7);
+        assert_eq!(snapshot.zero_copy_tile_bytes_avoided, 8_601_600);
+        assert_eq!(snapshot.yolox_fast_decode_skipped_rows, 10);
+    }
+}

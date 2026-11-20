@@ -1,0 +1,140 @@
+import React from "react";
+import { HStack, Text, VStack } from "@chakra-ui/react";
+import { CheckCircle2, Circle } from "lucide-react";
+import { clipperTheme } from "../shared/theme.util";
+import { useClipperUi } from "../shared/use-clipper-ui.hook";
+import { resolveProcessingLabels } from "../shared/stage-labels.util";
+import type { ClipperPipelineState } from "../shared/state.util";
+import { ClipperProgressBar } from "./clipper-progress-bar.component";
+
+interface ClipperProcessingProps {
+  state: ClipperPipelineState;
+}
+
+const STEPS = [
+  { key: "uploading", label: "Upload & prepare" },
+  { key: "transcribing", label: "Transcribe speech" },
+  { key: "analyzing", label: "Detect faces & track action" },
+  { key: "preview", label: "Preview formats" },
+] as const;
+
+const STAGE_ORDER = [
+  "trimming",
+  "uploading",
+  "transcribing",
+  "analyzing",
+  "preview",
+  "done",
+] as const;
+
+type UiStepKey = (typeof STEPS)[number]["key"];
+
+function uiStepKeyForStage(stage: ClipperPipelineState["stage"]): UiStepKey | "trimming" | "done" | "error" | "rendering" {
+  if (stage === "idle") return "uploading";
+  if (stage === "analyzing-faces" || stage === "analyzing-subjects") return "analyzing";
+  return stage;
+}
+
+function formatEta(seconds: number | null): string | undefined {
+  if (seconds == null || !Number.isFinite(seconds) || seconds < 1) return undefined;
+  if (seconds < 60) return `~${Math.round(seconds)}s remaining`;
+  return `~${Math.round(seconds / 60)}m remaining`;
+}
+
+function stepStatus(
+  stepKey: UiStepKey,
+  current: ClipperPipelineState["stage"],
+): "done" | "active" | "pending" {
+  const stepIndex = STAGE_ORDER.indexOf(stepKey);
+  const currentUi = uiStepKeyForStage(current);
+  const currentIndex = STAGE_ORDER.indexOf(
+    currentUi as (typeof STAGE_ORDER)[number],
+  );
+
+  if (current === "done" || currentIndex > stepIndex) return "done";
+  if (currentUi === stepKey || (current === "trimming" && stepKey === "uploading")) return "active";
+  return "pending";
+}
+
+export const ClipperProcessing: React.FC<ClipperProcessingProps> = ({ state }) => {
+  const { theme } = useClipperUi();
+  const showDetailBar =
+    (state.stage === "transcribing" ||
+      state.stage === "analyzing-faces" ||
+      state.stage === "analyzing-subjects") &&
+    state.stageDetailLabel != null;
+  const showUploadBar = state.stage === "uploading" && state.stageProgress != null;
+
+  const barLabel = showDetailBar
+    ? state.stageDetailLabel
+    : showUploadBar
+      ? 
+        state.stageMessage.trim() ||
+        (state.stageMessage.toLowerCase().includes("trim")
+          ? "Trimming clip"
+          : "Saving to project")
+      : null;
+  const labels = resolveProcessingLabels(state.stageMessage, barLabel);
+
+  return (
+    <VStack align="stretch" gap={6}>
+      {state.clipDuration != null && (
+        <Text fontSize="sm" color={theme.text.muted}>
+          Clipping first {Math.round(state.clipDuration)}s
+          {state.sourceFileName ? ` of ${state.sourceFileName}` : ""}
+        </Text>
+      )}
+
+      <VStack align="stretch" gap={3}>
+        {STEPS.map((step) => {
+          const status = stepStatus(step.key, state.stage);
+          return (
+            <HStack key={step.key} gap={3}>
+              {status === "done" ? (
+                <CheckCircle2 size={20} color={clipperTheme.accentLight} />
+              ) : status === "active" ? (
+                <Circle size={20} color={clipperTheme.accentLight} fill={clipperTheme.accentLight} />
+              ) : (
+                <Circle size={20} color={theme.text.toggleThumbInactive} />
+              )}
+              <Text
+                color={
+                  status === "pending"
+                    ? theme.text.toggleThumbInactive
+                    : status === "active"
+                      ? theme.text.primary
+                      : clipperTheme.accentLight
+                }
+                fontWeight={status === "active" ? "semibold" : "medium"}
+              >
+                {step.label}
+              </Text>
+            </HStack>
+          );
+        })}
+      </VStack>
+
+      {labels.message ? (
+        <Text fontSize="sm" color={theme.text.muted}>
+          {labels.message}
+        </Text>
+      ) : null}
+
+      {showUploadBar && labels.detailLabel && (
+        <ClipperProgressBar label={labels.detailLabel} value={state.stageProgress} />
+      )}
+
+      {showDetailBar && labels.detailLabel && (
+        <ClipperProgressBar
+          label={labels.detailLabel}
+          value={state.stageDetailProgress}
+          caption={
+            state.stage === "analyzing-faces"
+              ? formatEta(state.analysisEtaSeconds)
+              : undefined
+          }
+        />
+      )}
+    </VStack>
+  );
+};
